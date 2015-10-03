@@ -1,19 +1,22 @@
 package starbot;
 
-import java.io.IOException;
 import java.io.OutputStream;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import javax.annotation.Resource;
+
 import lombok.AllArgsConstructor;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.event.ApplicationEventMulticaster;
@@ -22,14 +25,13 @@ import org.springframework.context.event.SimpleApplicationEventMulticaster;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.remoting.support.SimpleHttpServerFactoryBean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.social.ApiException;
 import org.springframework.social.twitter.api.Tweet;
 import org.springframework.social.twitter.api.impl.TwitterTemplate;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.DefaultResponseErrorHandler;
 import org.springframework.web.client.RestTemplate;
 
 @SpringBootApplication
@@ -38,26 +40,20 @@ import org.springframework.web.client.RestTemplate;
 public class GithubStarbotApplication {
 
 	@Bean
-	TwitterTemplate twitterTemplate(@Value("${twitter.app-id}") String appId,
-			@Value("${twitter.app-secret}") String appSecret,
-			@Value("${twitter.access-token}") String accessToken,
-			@Value("${twitter.access-token-secret}") String accessTokenSecret) {
-		TwitterTemplate template = new TwitterTemplate(appId, appSecret, accessToken,
-				accessTokenSecret);
-		template.getRestTemplate().setErrorHandler(new DefaultResponseErrorHandler() {
-			@Override
-			public void handleError(ClientHttpResponse response) throws IOException {
-				log.warn("CODE={},TEXT={}", response.getStatusCode(),
-						response.getStatusText());
-			}
-		});
-		return template;
+	Map<String, TwitterTemplate> twitterTemplates(TwitterApiConfig apiConfig) {
+		return apiConfig.getApiInfo().entrySet().stream()
+				.collect(Collectors.toMap(Map.Entry::getKey, x -> {
+					TwitterApiConfig.TwitterApiInfo appInfo = x.getValue();
+					return new TwitterTemplate(appInfo.getAppId(), appInfo.getAppSecret(),
+							appInfo.getAccessToken(), appInfo.getAccessTokenSecret());
+				}));
 	}
 
 	@Bean
-	ApplicationEventMulticaster applicationEventMulticaster() {
+	ApplicationEventMulticaster applicationEventMulticaster(
+			@Value("${event.consumer-threads:8}") int consumerThreads) {
 		SimpleApplicationEventMulticaster eventMulticaster = new SimpleApplicationEventMulticaster();
-		eventMulticaster.setTaskExecutor(Executors.newSingleThreadExecutor());
+		eventMulticaster.setTaskExecutor(Executors.newFixedThreadPool(consumerThreads));
 		return eventMulticaster;
 	}
 
@@ -89,42 +85,50 @@ public class GithubStarbotApplication {
 @Component
 @Slf4j
 class StarChecker {
-	@Autowired
-	TwitterTemplate twitterTemplate;
+	@Resource
+	Map<String, TwitterTemplate> twitterTemplates;
 	@Autowired
 	RestTemplate restTemplate;
 	@Autowired
 	ApplicationEventPublisher publisher;
-	@Value("${github.username}")
-	String username;
 
 	@Scheduled(initialDelay = 0, fixedRate = 3600_000)
 	public void check() {
+		twitterTemplates.keySet().forEach(publisher::publishEvent);
+	}
+
+	@EventListener
+	void handleUserEvent(String username) {
+		TwitterTemplate twitterTemplate = twitterTemplates.get(username);
 		ResponseEntity<List<Map<String, Object>>> response = restTemplate.exchange(
 				"https://api.github.com/users/{username}/starred", HttpMethod.GET, null,
 				new ParameterizedTypeReference<List<Map<String, Object>>>() {
 				}, Collections.singletonMap("username", username));
-		log.info("check...");
 		List<Star> body = response.getBody().stream()
 				.map(m -> new Star((String) m.get("full_name"),
 						(String) m.get("html_url"), (String) m.get("description")))
 				.collect(Collectors.toList());
 
-		List<Tweet> twitters = twitterTemplate.timelineOperations().getUserTimeline(1);
-		String lastName = twitters.size() > 0 ? twitters.get(0).getText().split("\\s")[0]
-				: "";
+		try {
+			List<Tweet> twitters = twitterTemplate.timelineOperations()
+					.getUserTimeline(1);
+			String lastName = twitters.size() > 0
+					? twitters.get(0).getText().split("\\s")[0] : "";
 
-		List<Star> stars = new ArrayList<>();
-		for (Star star : body) {
-			if (Objects.equals(lastName, star.name)) {
-				break;
+			List<Star> stars = new ArrayList<>();
+			for (Star star : body) {
+				if (Objects.equals(lastName, star.name)) {
+					break;
+				}
+				stars.add(star);
 			}
-			stars.add(star);
+			Collections.reverse(stars);
+			log.info("[{}] found {}", username, stars);
+			publisher.publishEvent(new StarEvent(username, stars));
 		}
-		Collections.reverse(stars);
-		log.info("found {}", stars);
-
-		stars.forEach(publisher::publishEvent);
+		catch (ApiException e) {
+			log.warn("api error", e);
+		}
 	}
 
 }
@@ -132,21 +136,30 @@ class StarChecker {
 @Component
 @Slf4j
 class StarTweet {
-	@Autowired
-	TwitterTemplate twitterTemplate;
+	@Resource
+	Map<String, TwitterTemplate> twitterTemplates;
 
 	@EventListener
-	void tweetStar(Star star) throws InterruptedException {
-		String text = star.name + " " + star.description;
-		if (text.length() > 116) {
-			text = text.substring(0, 113) + "...";
+	void tweetStar(StarEvent starEvent) throws InterruptedException {
+		for (Star star : starEvent.stars) {
+			String text = star.name + " " + star.description;
+			if (text.length() > 116) {
+				text = text.substring(0, 113) + "...";
+			}
+			String status = text + " " + star.url;
+			log.info("[] tweet {}", starEvent.username, status);
+			twitterTemplates.get(starEvent.username).timelineOperations()
+					.updateStatus(status);
+			// wait
+			TimeUnit.SECONDS.sleep(2);
 		}
-		String status = text + " " + star.url;
-		log.info("tweet {}", status);
-		twitterTemplate.timelineOperations().updateStatus(status);
-		// wait
-		TimeUnit.SECONDS.sleep(2);
 	}
+}
+
+@AllArgsConstructor
+class StarEvent {
+	final String username;
+	final List<Star> stars;
 }
 
 @AllArgsConstructor
@@ -158,5 +171,20 @@ class Star {
 	@Override
 	public String toString() {
 		return name;
+	}
+}
+
+@Component
+@ConfigurationProperties("twitter")
+@Data
+class TwitterApiConfig {
+	private Map<String, TwitterApiInfo> apiInfo = new LinkedHashMap<>();
+
+	@Data
+	public static class TwitterApiInfo {
+		private String appId;
+		private String appSecret;
+		private String accessToken;
+		private String accessTokenSecret;
 	}
 }
