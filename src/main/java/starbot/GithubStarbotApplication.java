@@ -1,9 +1,11 @@
 package starbot;
 
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 import javax.annotation.Resource;
@@ -24,7 +26,9 @@ import org.springframework.context.event.EventListener;
 import org.springframework.context.event.SimpleApplicationEventMulticaster;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.feed.AbstractWireFeedHttpMessageConverter;
 import org.springframework.remoting.support.SimpleHttpServerFactoryBean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -33,6 +37,8 @@ import org.springframework.social.twitter.api.Tweet;
 import org.springframework.social.twitter.api.impl.TwitterTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
+
+import com.rometools.rome.feed.rss.Channel;
 
 @SpringBootApplication
 @Slf4j
@@ -59,7 +65,16 @@ public class GithubStarbotApplication {
 
 	@Bean
 	RestTemplate restTemplate() {
-		return new RestTemplate();
+		RestTemplate restTemplate = new RestTemplate();
+		restTemplate.getMessageConverters()
+				.add(new AbstractWireFeedHttpMessageConverter<Channel>(
+						new MediaType("application", "xml", StandardCharsets.UTF_8)) {
+					@Override
+					protected boolean supports(Class<?> clazz) {
+						return Channel.class.isAssignableFrom(clazz);
+					}
+				});
+		return restTemplate;
 	}
 
 	@Bean
@@ -91,16 +106,23 @@ class StarChecker {
 	RestTemplate restTemplate;
 	@Autowired
 	ApplicationEventPublisher publisher;
+	@Autowired
+	TwitterApiConfig apiConfig;
 
 	@Scheduled(initialDelay = 0, fixedRate = 3600_000)
 	public void check() {
-		twitterTemplates.keySet().forEach(publisher::publishEvent);
+		twitterTemplates.forEach((username, twitterTemplate) -> {
+			TwitterApiConfig.Source source = apiConfig.getApiInfo().get(username)
+					.getSource();
+			publisher.publishEvent(source.createEvent.apply(username, twitterTemplate));
+		});
 	}
 
 	@EventListener
-	void handleUserEvent(String username) {
-		log.info("[{}] check...", username);
-		TwitterTemplate twitterTemplate = twitterTemplates.get(username);
+	void handleGitHubEvent(GitHubEvent gitHubEvent) {
+		String username = gitHubEvent.username;
+		TwitterTemplate twitterTemplate = gitHubEvent.twitterTemplate;
+		log.info("[{}] check github...", username);
 		ResponseEntity<List<Map<String, Object>>> response = restTemplate.exchange(
 				"https://api.github.com/users/{username}/starred", HttpMethod.GET, null,
 				new ParameterizedTypeReference<List<Map<String, Object>>>() {
@@ -109,7 +131,25 @@ class StarChecker {
 				.map(m -> new Star((String) m.get("full_name"),
 						(String) m.get("html_url"), (String) m.get("description")))
 				.collect(Collectors.toList());
+		this.publishStars(username, twitterTemplate, body);
+	}
 
+	@EventListener
+	void handleHatbuEvent(HatebuEvent hatebuEvent) {
+		String username = hatebuEvent.username;
+		TwitterTemplate twitterTemplate = hatebuEvent.twitterTemplate;
+		log.info("[{}] check hatebu...", username);
+		ResponseEntity<Channel> response = restTemplate.exchange(
+				"http://b.hatena.ne.jp/{username}/rss?tag=java", HttpMethod.GET, null,
+				Channel.class, Collections.singletonMap("username", username));
+		List<Star> body = response.getBody()
+				.getItems().stream().map(x -> new Star(x.getTitle().replace(" ", ""),
+						x.getLink(), x.getDescription().getValue()))
+				.collect(Collectors.toList());
+		this.publishStars(username, twitterTemplate, body);
+	}
+
+	void publishStars(String username, TwitterTemplate twitterTemplate, List<Star> body) {
 		try {
 			List<Tweet> twitters = twitterTemplate.timelineOperations()
 					.getUserTimeline(1);
@@ -125,20 +165,17 @@ class StarChecker {
 			}
 			Collections.reverse(stars);
 			log.info("[{}] found {}", username, stars);
-			publisher.publishEvent(new StarEvent(username, stars));
+			publisher.publishEvent(new StarEvent(username, stars, twitterTemplate));
 		}
 		catch (ApiException e) {
 			log.warn("api error", e);
 		}
 	}
-
 }
 
 @Component
 @Slf4j
-class StarTweet {
-	@Resource
-	Map<String, TwitterTemplate> twitterTemplates;
+class Twitterer {
 
 	@EventListener
 	void tweetStar(StarEvent starEvent) throws InterruptedException {
@@ -148,9 +185,8 @@ class StarTweet {
 				text = text.substring(0, 113) + "...";
 			}
 			String status = text + " " + star.url;
-			log.info("[] tweet {}", starEvent.username, status);
-			twitterTemplates.get(starEvent.username).timelineOperations()
-					.updateStatus(status);
+			log.info("[{}] tweet {}", starEvent.username, status);
+			starEvent.twitterTemplate.timelineOperations().updateStatus(status);
 			// wait
 			TimeUnit.SECONDS.sleep(2);
 		}
@@ -161,6 +197,7 @@ class StarTweet {
 class StarEvent {
 	final String username;
 	final List<Star> stars;
+	final TwitterTemplate twitterTemplate;
 }
 
 @AllArgsConstructor
@@ -175,14 +212,34 @@ class Star {
 	}
 }
 
+@AllArgsConstructor
+class GitHubEvent {
+	final String username;
+	final TwitterTemplate twitterTemplate;
+}
+
+@AllArgsConstructor
+class HatebuEvent {
+	final String username;
+	final TwitterTemplate twitterTemplate;
+}
+
 @Component
 @ConfigurationProperties("twitter")
 @Data
 class TwitterApiConfig {
 	private Map<String, TwitterApiInfo> apiInfo = new LinkedHashMap<>();
 
+	@AllArgsConstructor
+	public enum Source {
+		GITHUB(GitHubEvent::new), HATEBU(HatebuEvent::new);
+
+		final BiFunction<String, TwitterTemplate, ?> createEvent;
+	}
+
 	@Data
 	public static class TwitterApiInfo {
+		private Source source = Source.GITHUB;
 		private String appId;
 		private String appSecret;
 		private String accessToken;
