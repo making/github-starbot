@@ -99,6 +99,7 @@ class StarChecker {
 
 	@EventListener
 	void handleUserEvent(String username) {
+		log.info("[{}] check...", username);
 		TwitterTemplate twitterTemplate = twitterTemplates.get(username);
 		ResponseEntity<List<Map<String, Object>>> response = restTemplate.exchange(
 				"https://api.github.com/users/{username}/starred", HttpMethod.GET, null,
