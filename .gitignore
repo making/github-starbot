@@ -1,0 +1,6 @@
+application-cloud.properties
+.idea
+*.iml
+target
+*~
+.*~
